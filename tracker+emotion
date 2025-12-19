@@ -1,0 +1,142 @@
+import os
+import cv2
+import numpy as np
+from pythonosc import udp_client
+
+# Ottimizzazione TensorFlow
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+print("--- Caricamento Modelli AI (Precisione Aumentata) ---")
+
+import mediapipe as mp
+from deepface import DeepFace
+
+# Inizializzazione MediaPipesource venv/bin/activate
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.6, # Aumentata la soglia di rilevamento
+    min_tracking_confidence=0.6
+)
+
+# Configurazione OSC
+client_emotion = udp_client.SimpleUDPClient("127.0.0.1", 8000)
+client_head = udp_client.SimpleUDPClient("127.0.0.1", 9000)
+
+# Modello 3D Testa
+face_3d_model = np.array([
+    (0.0, 0.0, 0.0),            # Naso
+    (0.0, -330.0, -65.0),       # Mento
+    (-225.0, 170.0, -135.0),    # Occhio SX
+    (225.0, 170.0, -135.0),     # Occhio DX
+    (-150.0, -150.0, -125.0),   # Bocca SX
+    (150.0, -150.0, -125.0)     # Bocca DX
+], dtype=np.float64)
+
+cap = cv2.VideoCapture(0)
+frame_count = 0
+emotion_label = "Inizializzazione..."
+all_emotions = {}
+x_deg, y_deg, z_deg = 0.0, 0.0, 0.0
+
+print("Sistema pronto. Analisi ROI attiva.")
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success: break
+
+    frame_count += 1
+    frame = cv2.flip(frame, 1)
+    img_h, img_w, _ = frame.shape
+    
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb_frame)
+
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
+            
+            # --- 1. COORDINATE E RITAGLIO VOLTO (ROI) ---
+            h, w, c = frame.shape
+            cx_min, cy_min = w, h
+            cx_max, cy_max = 0, 0
+            
+            for lm in face_landmarks.landmark:
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                if cx < cx_min: cx_min = cx
+                if cy < cy_min: cy_min = cy
+                if cx > cx_max: cx_max = cx
+                if cy > cy_max: cy_max = cy
+
+            # Aggiungiamo un piccolo margine al ritaglio
+            margin = 20
+            roi_y1, roi_y2 = max(0, cy_min - margin), min(h, cy_max + margin)
+            roi_x1, roi_x2 = max(0, cx_min - margin), min(w, cx_max + margin)
+            face_roi = frame[roi_y1:roi_y2, roi_x1:roi_x2]
+
+            # --- 2. HEAD TRACKING ---
+            def get_coords(idx):
+                lm = face_landmarks.landmark[idx]
+                return [lm.x * img_w, lm.y * img_h]
+
+            face_2d = np.array([get_coords(1), get_coords(199), get_coords(33), 
+                               get_coords(263), get_coords(61), get_coords(291)], dtype=np.float64)
+
+            focal_length = 1 * img_w
+            cam_matrix = np.array([[focal_length, 0, img_w / 2], [0, focal_length, img_h / 2], [0, 0, 1]])
+            _, rot_vec, trans_vec = cv2.solvePnP(face_3d_model, face_2d, cam_matrix, np.zeros((4, 1)))
+            rmat, _ = cv2.Rodrigues(rot_vec)
+            angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+
+            x_deg, y_deg, z_deg = angles[0]*360, angles[1]*360, angles[2]*360
+            client_head.send_message("/head/orientation", [float(x_deg), float(y_deg), float(z_deg)])
+
+            # --- 3. ANALISI EMOZIONI (ROI Focalizzata) ---
+            # Analizziamo ogni 5 frame per maggiore reattività
+            if frame_count % 5 == 0 and face_roi.size > 0:
+                try:
+                    # Analizziamo solo il ritaglio del volto (ROI) per maggiore precisione
+                    res = DeepFace.analyze(face_roi, actions=['emotion'], enforce_detection=False, silent=True)
+                    emotion_label = res[0]['dominant_emotion']
+                    all_emotions = res[0]['emotion']
+                    
+                    # Invio OSC: Emozione dominante e tutti i singoli valori
+                    client_emotion.send_message("/avatar/emotion", emotion_label)
+                    for emo_name, score in all_emotions.items():
+                        client_emotion.send_message(f"/avatar/score/{emo_name}", float(score))
+                except:
+                    pass
+
+            # --- DISEGNO ---
+            mp_drawing.draw_landmarks(frame, face_landmarks, mp_face_mesh.FACEMESH_CONTOURS, 
+                                     mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1))
+
+        # --- PANNELLO DATI ESTESO ---
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (320, 240), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Head Data
+        cv2.putText(frame, f"Head X:{x_deg:>6.1f} Y:{y_deg:>6.1f} Z:{z_deg:>6.1f}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Emotion List
+        y0, dy = 60, 25
+
+        cv2.putText(frame, f"DOMINANT: {emotion_label.upper()}", (20, y0), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        if all_emotions:
+            for i, (emo, val) in enumerate(all_emotions.items()):
+                color = (255, 255, 255) if emo != emotion_label else (0, 255, 255)
+                cv2.putText(frame, f"{emo:<10}: {val:>5.1f}%", (20, y0 + 30 + i*20), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+    cv2.imshow('Face Precision Tracker', frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release()
+cv2.destroyAllWindows()
